@@ -1,0 +1,23 @@
+{
+  "_comment": "The source registry. Add/remove a site = add/remove one object. No code. This is what the owner edits (or uses a form on top of) to manage sources.",
+  "sources": [
+    {
+      "name": "source-a",
+      "url": "https://example-a.com/events",
+      "kind": "structured",
+      "timezone": "America/New_York"
+    },
+    {
+      "name": "source-b",
+      "url": "https://example-b.org/whats-on",
+      "kind": "messy",
+      "timezone": "America/New_York"
+    },
+    {
+      "name": "source-c",
+      "url": "https://example-c.net/list",
+      "kind": "structured",
+      "timezone": "America/New_York"
+    }
+  ]
+}

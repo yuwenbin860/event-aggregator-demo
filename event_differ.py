@@ -208,29 +208,50 @@ class SupabaseDraftStore(DraftStore):
 
 
 # ============================================================
+# Source config — read from sources.json (owner edits this, no code)
+# ============================================================
+
+def load_sources(path: str = "sources.json") -> list[SourceSpec]:
+    """Read the source registry. Add/remove a site = add/remove one object there."""
+    import json, os
+    if not os.path.exists(path):
+        return list(SOURCES)       # fall back to built-in defaults
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    return [SourceSpec(name=s["name"], url=s["url"], kind=s["kind"], parser=s["kind"])
+            for s in data.get("sources", [])]
+
+
+# ============================================================
 # Source fetching with isolation — one broken site ≠ a dead run
 # ============================================================
 
-def fetch_source(spec: SourceSpec, mock_pool: dict[str, list[Event]]) -> list[Event]:
+def fetch_source(spec: SourceSpec, pages: dict[str, "RawPage"]) -> list[Event]:
     """
-    Each source is fetched independently. A missing/empty result here models a
-    real failure (site down, or returned 200 but parser found nothing — the
-    silent-layout-change case). The caller catches it and keeps going with the
-    other sources.
+    Fetch a source's page and run it through the parser fallback chain
+    (JSON-LD → text extraction → none). In production, `pages[spec.name]` is
+    replaced by an HTTP/Playwright download; here it's a mock page body.
 
-    In production this swaps in the real parser named in spec.parser; the mock
-    stands in for it.
+    Returns parsed events. Raises if the source can't be reached at all OR if
+    the parser chain finds 0 events — the second case is the silent-layout-change
+    failure that's most dangerous, so we surface it loudly rather than silently
+    treating "0 events" as "nothing changed."
     """
-    if spec.name not in mock_pool:
-        raise RuntimeError(f"{spec.name}: fetch failed — 0 events parsed (selector drift or site down)")
-    return mock_pool[spec.name]
+    from parsers import parse_page            # local import keeps demo entry simple
+    if spec.name not in pages:
+        raise RuntimeError(f"{spec.name}: fetch failed — site unreachable")
+    result = parse_page(pages[spec.name])
+    if not result.events:
+        raise RuntimeError(f"{spec.name}: 0 events parsed — {result.note}")
+    return result.events
 
 
-def run_weekly(prev_snapshot: dict[str, Event], mock_pool: dict[str, list[Event]], store: DraftStore):
+def run_weekly(prev_snapshot: dict[str, Event], pages: dict[str, "RawPage"],
+               store: DraftStore, sources: list[SourceSpec] | None = None):
     """
-    The Wednesday run. Pulls every source, builds this week's snapshot, diffs
-    against last week, and writes only NEW / UPDATED / CANCELLED into review.
-    Unchanged events are skipped — no duplicate drafts.
+    The Wednesday run. Pulls every source through the parser chain, builds this
+    week's snapshot, diffs against last week, and writes only NEW / UPDATED /
+    CANCELLED into review. Unchanged events are skipped — no duplicate drafts.
 
     Returns (current_snapshot, failed_sources) so next week has a baseline and
     we know which sources to trust for cancellation calls.
@@ -242,9 +263,9 @@ def run_weekly(prev_snapshot: dict[str, Event], mock_pool: dict[str, list[Event]
     current: dict[str, Event] = {}
     failed: set[str] = set()
 
-    for spec in SOURCES:
+    for spec in (sources or SOURCES):
         try:
-            events = fetch_source(spec, mock_pool)
+            events = fetch_source(spec, pages)
             for e in events:
                 current[event_id(e)] = e
             print(f"  OK    {spec.name} ({spec.kind}): {len(events)} events")
@@ -282,7 +303,31 @@ def run_weekly(prev_snapshot: dict[str, Event], mock_pool: dict[str, list[Event]
 
 
 # ============================================================
-# Mock data: two snapshots that tell a clean story
+# CSV export — a concrete, human-readable review queue the owner opens in Excel
+# ============================================================
+
+def export_review_csv(store: "MockDraftStore", path: str = "review_queue.csv") -> None:
+    """
+    Write the review queue to CSV so a non-technical owner can open it in Excel/
+    Sheets, eyeball each row, and decide. In production these same rows are also
+    status=draft in Lovable; the CSV is a fallback view + an export format for
+    any site that can't take direct DB writes.
+    """
+    import csv
+    if not store.rows:
+        print("  (review queue empty — nothing to export)")
+        return
+    fields = ["status", "reason", "name", "date", "time", "venue", "price", "source", "url"]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        w.writeheader()
+        for row in store.rows:
+            w.writerow(row)
+    print(f"  → wrote {len(store.rows)} review rows to {path} (open in Excel/Sheets)")
+
+
+# ============================================================
+# Mock page bodies — what fetch_source would download in production
 # ============================================================
 
 def _ev(name, date, source, **kw):
@@ -291,61 +336,98 @@ def _ev(name, date, source, **kw):
 
 
 # Last week's baseline snapshot (what the previous run captured).
+# Note: source-b's text extractor can't see venue, so baseline venue is None too
+# — this keeps identity consistent week to week so Jazz Night is recognized as an
+# UPDATE (time changed) rather than a new event.
 LAST_WEEK = {
     event_id(_ev("Morning Yoga", "2026-08-15", "source-a", time="07:00", venue="Park Studio", price="$10")):
         _ev("Morning Yoga", "2026-08-15", "source-a", time="07:00", venue="Park Studio", price="$10"),
-    event_id(_ev("Jazz Night", "2026-08-16", "source-b", time="20:00", venue="Blue Bar", price="$20")):
-        _ev("Jazz Night", "2026-08-16", "source-b", time="20:00", venue="Blue Bar", price="$20"),
-    event_id(_ev("Farmers Market", "2026-08-17", "source-a", time="09:00", venue="Town Sq", price="Free")):
-        _ev("Farmers Market", "2026-08-17", "source-a", time="09:00", venue="Town Sq", price="Free"),
+    event_id(_ev("Jazz Night", "2026-08-16", "source-b", time="8:00pm", venue=None, price="$20")):
+        _ev("Jazz Night", "2026-08-16", "source-b", time="8:00pm", venue=None, price="$20"),
+    event_id(_ev("Farmers Market", "2026-08-17", "source-a", time="9:00am", venue="Town Sq", price="Free")):
+        _ev("Farmers Market", "2026-08-17", "source-a", time="9:00am", venue="Town Sq", price="Free"),
 }
 
-# This week's pulls per source.
-THIS_WEEK_A = [
-    _ev("Morning Yoga", "2026-08-15", "source-a", time="07:00", venue="Park Studio", price="$10"),   # unchanged
-    _ev("Tech Meetup", "2026-08-18", "source-a", time="18:30", venue="Hub", price="Free"),           # NEW
-    # Farmers Market gone from source-a → genuinely looks cancelled
-]
-THIS_WEEK_B = [
-    # Jazz Night time moved 20:00 → 21:00 (same identity, field changed)
-    _ev("Jazz Night", "2026-08-16", "source-b", time="21:00", venue="Blue Bar", price="$20"),
-]
-THIS_WEEK_C = [
-    _ev("Art Walk", "2026-08-19", "source-c", time="17:00", venue="Downtown", price="Free"),         # NEW
-]
+
+def _make_pages():
+    """Mock raw pages for this week's pull. In production these come from HTTP."""
+    from parsers import RawPage
+    # source-a: structured (schema.org JSON-LD). Layout-resilient.
+    page_a = RawPage(
+        source="source-a", url="https://example-a.com/events",
+        jsonld=[
+            {"@type": "Event", "name": "Morning Yoga", "startDate": "2026-08-15T07:00",
+             "location": {"@type": "Place", "name": "Park Studio"},
+             "offers": {"price": "10", "priceCurrency": "USD"}},                  # unchanged
+            {"@type": "Event", "name": "Tech Meetup", "startDate": "2026-08-18T18:30",
+             "location": "Hub", "offers": {"price": "0", "priceCurrency": "USD"}}, # NEW
+            # Farmers Market gone from source-a → genuinely looks cancelled
+        ],
+    )
+    # source-b: messy plain text (the "plain, inconsistent pages" the client
+    # copies from by hand today). No JSON-LD — text extraction handles it.
+    page_b = RawPage(
+        source="source-b", url="https://example-b.org/whats-on",
+        text="Jazz Night\nAug 16, 2026 9:00pm at Blue Bar\nTickets $20",           # time moved → UPDATED
+    )
+    # source-c: structured, healthy this week.
+    page_c = RawPage(
+        source="source-c", url="https://example-c.net/list",
+        jsonld=[
+            {"@type": "Event", "name": "Art Walk", "startDate": "2026-08-19T17:00",
+             "location": "Downtown", "offers": {"price": "0", "priceCurrency": "USD"}},  # NEW
+        ],
+    )
+    return {"source-a": page_a, "source-b": page_b, "source-c": page_c}
+
+
+def _make_broken_pages():
+    """Scenario 2: source-c redesigned — JSON-LD gone, text scrambled → 0 events."""
+    from parsers import RawPage
+    base = _make_pages()
+    base["source-c"] = RawPage(
+        source="source-c", url="https://example-c.net/list",
+        jsonld=[], text="Welcome to our new site! Check back soon for upcoming events.",
+    )
+    return base
 
 
 # ============================================================
-# main — two scenarios end to end
+# main — three scenarios end to end
 # ============================================================
 
 def main():
-    print("Event Aggregator Demo — weekly snapshot diff + review-store writer")
-    print("Zero dependencies. Real Supabase draft writer included (not exercised here).\n")
+    print("Event Aggregator Demo — collection + diff + review queue")
+    print("Zero dependencies. Parser fallback chain (JSON-LD → text) + real Supabase writer.\n")
 
+    sources = load_sources()
     store = MockDraftStore()
 
-    # --- Scenario 1: a normal weekly run ---
-    healthy_pool = {"source-a": THIS_WEEK_A, "source-b": THIS_WEEK_B, "source-c": THIS_WEEK_C}
-    current, _ = run_weekly(LAST_WEEK, healthy_pool, store)
+    # --- Scenario 1: normal Wednesday run, all sources healthy ---
+    current, _ = run_weekly(LAST_WEEK, _make_pages(), store, sources)
 
-    # --- Scenario 2: source-c goes down (simulated layout change) ---
-    # source-c's event (Art Walk) must NOT be flagged as cancelled — we simply
-    # didn't see it. This is the "no false alarms when a site has a bad day" case.
+    # --- Scenario 2: source-c redesigns and breaks (0 events parsed) ---
+    # Its event (Art Walk) must NOT be flagged as cancelled — we can't tell
+    # "cancelled" from "we failed to fetch it", so we hold it as indeterminate.
+    # This is the "no false alarms when a site has a bad week" case.
     print("\n" + "=" * 66)
-    print("  SCENARIO 2 — source-c breaks (simulated layout change)")
+    print("  SCENARIO 2 — source-c redesigns (layout change breaks parsing)")
     print("=" * 66)
-    broken_pool = {"source-a": THIS_WEEK_A, "source-b": THIS_WEEK_B}  # source-c omitted → fetch raises
-    run_weekly(current, broken_pool, store)
+    run_weekly(current, _make_broken_pages(), store, sources)
 
-    # --- Summary of what landed in review ---
+    # --- Review queue summary + CSV export ---
     print("\n" + "=" * 66)
-    print("  REVIEW QUEUE (drafts that would appear in Lovable)")
+    print("  REVIEW QUEUE (what lands for you to review this week)")
     print("=" * 66)
     for row in store.rows:
         print(f"  [{row['status']:<22}] {row.get('name', '?')}")
-    print("\n  In production: these are status=draft rows in your Lovable events table.")
-    print("  You edit/approve/reject each, then publish. Nothing goes live automatically.")
+    print("\n  In production: these are status=draft rows in your Lovable events table,")
+    print("  plus a CSV export you can open in Excel. You edit/approve/reject, then publish.")
+
+    print("\n" + "=" * 66)
+    print("  CSV EXPORT")
+    print("=" * 66)
+    export_review_csv(store)
 
 
 if __name__ == "__main__":

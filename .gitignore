@@ -16,3 +16,6 @@ venv/
 Thumbs.db
 .vscode/
 .idea/
+
+# Demo run output (generated, not source)
+review_queue.csv
